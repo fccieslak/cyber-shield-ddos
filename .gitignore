@@ -1,0 +1,27 @@
+# Dados: baixar com scripts/baixar_dados.sh (ficam fora do repositório)
+*.csv
+*.zip
+*.parquet
+*.duckdb
+dados/
+
+# Ambiente virtual e caches
+.venv/
+venv-ddos/
+__pycache__/
+*.pyc
+
+# Arquivos gerados na raiz (o exemplo versionado fica em docs/)
+/painel_grafos.html
+/painel_grafos.json
+/mapa_*.png
+
+# Slides e apresentações ficam fora do repositório
+slides/
+*.pptx
+*.key
+
+# Sistema e editor
+.DS_Store
+.vscode/
+.idea/
