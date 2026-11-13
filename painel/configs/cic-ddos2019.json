@@ -1,0 +1,15 @@
+{
+  "nome": "cic-ddos2019",
+  "banco": "~/ddos-dados/fluxos.duckdb",
+  "pastas": {"treino": "~/ddos-dados/treino", "teste": "~/ddos-dados/teste"},
+  "remover_prefixo_rotulo": "DrDoS_",
+  "colunas": {
+    "tipo": "Label", "ts": "Timestamp",
+    "sip": "Source IP", "sport": "Source Port",
+    "dip": "Destination IP", "dport": "Destination Port", "proto": "Protocol",
+    "duracao": "Flow Duration",
+    "pkts_fwd": "Total Fwd Packets", "pkts_bwd": "Total Backward Packets",
+    "bytes_fwd": "Total Length of Fwd Packets", "bytes_bwd": "Total Length of Bwd Packets",
+    "bytes_s": "Flow Bytes/s", "pkts_s": "Flow Packets/s"
+  }
+}

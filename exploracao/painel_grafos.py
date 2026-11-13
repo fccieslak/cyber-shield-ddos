@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Painel de grafos por tipo de trafego do CIC-DDoS2019 (dia de teste).
+"""Painel de grafos por tipo de trafego, lendo os fluxos do banco DuckDB.
 
-Cada fluxo dos CSVs vira uma aresta entre dois nos (IP:porta de origem e IP:porta de destino).
+Cada fluxo vira uma aresta entre dois nos (IP:porta de origem e IP:porta de destino).
 Cada tipo de trafego forma uma "ilha" no mapa; o BENIGN forma uma ilha por arquivo.
 A linha do tempo usa os horarios medidos nos timestamps.
 
-Passo 1 (demora; le os CSVs; precisa de duckdb e numpy do venv):
-    source ~/venv-ddos/bin/activate
-    cd ~/ddos-dados && python painel_grafos.py --medir
+O banco e criado antes por painel/ingestao.py (padrao: ~/ddos-dados/fluxos.duckdb).
 
-Passo 2 (so gera o HTML a partir das medidas; segundos):
-    cd ~/ddos-dados && python painel_grafos.py
+Passo 1 (le o banco e mede):
+    python exploracao/painel_grafos.py --medir
+Passo 2 (so gera o HTML a partir das medidas):
+    python exploracao/painel_grafos.py
+Verificacao (confere os fluxos usados contra o banco e reconstroi o grafo):
+    python exploracao/painel_grafos.py --verificar
 
-Verificacao (confere se o grafo corresponde a tabela dos CSVs; precisa de scipy):
-    cd ~/ddos-dados && python painel_grafos.py --verificar
-
-Entrada : <BASE>/teste/*.csv
-Saidas  : <BASE>/painel_grafos.json, <BASE>/painel_grafos.html e
-          <BASE>/auditoria_grafos.csv (os fluxos exatos usados em cada grafo)
+Opcoes: --dia teste|treino (padrao: teste) e --dataset NOME (padrao: o primeiro do banco).
+Saidas em <BASE>: painel_grafos.json, painel_grafos.html e auditoria_grafos.csv
+(com sufixo do dataset e do dia quando nao forem os padroes).
 """
 import csv
 import glob
@@ -29,10 +28,23 @@ import sys
 from collections import Counter, defaultdict
 
 BASE = os.environ.get("DDOS_BASE", os.path.expanduser("~/ddos-dados"))
-PASTA = os.path.join(BASE, "teste")
-MEDIDAS = os.path.join(BASE, "painel_grafos.json")
-SAIDA = os.path.join(BASE, "painel_grafos.html")
-AUDITORIA = os.path.join(BASE, "auditoria_grafos.csv")
+BANCO = os.path.expanduser(os.environ.get("DDOS_BANCO", os.path.join(BASE, "fluxos.duckdb")))
+
+
+def opcao(nome, padrao=None):
+    if nome in sys.argv:
+        i = sys.argv.index(nome)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return padrao
+
+
+DIA = opcao("--dia", "teste")
+DATASET = opcao("--dataset")
+SUFIXO = (f"_{DATASET}" if DATASET else "") + ("" if DIA == "teste" else f"_{DIA}")
+MEDIDAS = os.path.join(BASE, f"painel_grafos{SUFIXO}.json")
+SAIDA = os.path.join(BASE, f"painel_grafos{SUFIXO}.html")
+AUDITORIA = os.path.join(BASE, f"auditoria_grafos{SUFIXO}.csv")
 N_FLUXOS = 200            # fluxos usados por ilha para construir o grafo
 SEMENTE_AMOSTRA = 42      # muda a amostra (mesmo valor = mesma amostra)
 LARG, ALT = 900, 480      # tamanho do mapa (unidades do desenho)
@@ -56,75 +68,57 @@ def familia(t):
 # --------------------------------------------------------------------------
 # Passo 1: medir
 # --------------------------------------------------------------------------
-def criar_f(con, arq):
-    """Le o CSV e cria a tabela temporaria f com as colunas usadas. Devolve False se faltar coluna."""
-    leitura = f"read_csv_auto('{arq}', header=true, ignore_errors=true)"
-    cols = [r[0] for r in con.sql(f"DESCRIBE SELECT * FROM {leitura}").fetchall()]
-    m = {c.strip(): c for c in cols}
-    precisa = ["Label", "Source IP", "Source Port", "Destination IP", "Destination Port"]
-    falt = [c for c in precisa if c not in m]
-    if falt:
-        print(f"   colunas ausentes {falt}; arquivo ignorado")
-        return False
-    ts = (f'TRY_CAST(CAST("{m["Timestamp"]}" AS VARCHAR) AS TIMESTAMP)'
-          if "Timestamp" in m else "CAST(NULL AS TIMESTAMP)")
-    fid = f'CAST("{m["Flow ID"]}" AS VARCHAR)' if "Flow ID" in m else "CAST(NULL AS VARCHAR)"
-    con.sql(f"""
-        CREATE OR REPLACE TEMP TABLE f AS
-        SELECT regexp_replace(TRIM(CAST("{m['Label']}" AS VARCHAR)), '^DrDoS_', '') AS tipo,
-               {fid} AS fid,
-               {ts} AS ts,
-               CAST("{m['Source IP']}" AS VARCHAR) AS sip,
-               TRY_CAST("{m['Source Port']}" AS BIGINT) AS sport,
-               CAST("{m['Destination IP']}" AS VARCHAR) AS dip,
-               TRY_CAST("{m['Destination Port']}" AS BIGINT) AS dport
-        FROM {leitura}
-    """)
-    return True
-
-
-def ler_csvs():
+def conectar():
+    """Conexao em memoria com o banco anexado so para leitura (como b)."""
     import duckdb
 
-    arquivos = sorted(glob.glob(os.path.join(PASTA, "*.csv")))
-    if not arquivos:
-        sys.exit(f"Nenhum CSV em {PASTA}")
+    if not os.path.exists(BANCO):
+        sys.exit(f"Banco nao encontrado: {BANCO}. Rode antes: python painel/ingestao.py painel/configs/cic-ddos2019.json")
     con = duckdb.connect()
-    con.sql("SET memory_limit='1GB'; SET threads=2;")
-    minutos = defaultdict(set)
-    minutos_ilha = defaultdict(set)
-    arestas = defaultdict(list)
-    totais = Counter()
-    for arq in arquivos:
-        nome = os.path.splitext(os.path.basename(arq))[0]
-        print(f"lendo {os.path.basename(arq)} ...", flush=True)
-        if not criar_f(con, arq):
-            continue
-        nulos = con.sql("SELECT COUNT(*) FROM f WHERE sip IS NULL OR dip IS NULL "
-                        "OR sport IS NULL OR dport IS NULL").fetchall()[0][0]
-        if nulos:
-            print(f"   {nulos} fluxos sem IP ou porta foram desconsiderados")
-        for tipo, mi in con.sql("""
-            SELECT tipo, CAST(epoch(date_trunc('minute', ts)) / 60 AS BIGINT)
-            FROM f WHERE ts IS NOT NULL GROUP BY 1, 2
-        """).fetchall():
-            minutos[tipo].add(int(mi))
-            minutos_ilha[tipo if tipo != "BENIGN" else f"BENIGN::{nome}"].add(int(mi))
-        for tipo, c in con.sql("SELECT tipo, COUNT(*) FROM f GROUP BY 1").fetchall():
-            totais[tipo if tipo != "BENIGN" else f"BENIGN::{nome}"] += int(c)
-        for tipo in [r[0] for r in con.sql("SELECT DISTINCT tipo FROM f").fetchall()]:
-            q = tipo.replace("'", "''")
-            # amostra reproduzivel: os N fluxos com menor hash do conteudo (mesma amostra a cada execucao)
-            linhas = con.sql(f"""
-                SELECT fid, CAST(ts AS VARCHAR), sip, sport, dip, dport
-                FROM f
-                WHERE tipo = '{q}' AND sip IS NOT NULL AND dip IS NOT NULL
-                  AND sport IS NOT NULL AND dport IS NOT NULL
-                ORDER BY hash(COALESCE(fid, ''), CAST(ts AS VARCHAR), sip, sport, dip, dport, {SEMENTE_AMOSTRA})
-                LIMIT {N_FLUXOS}
-            """).fetchall()
-            ilha = tipo if tipo != "BENIGN" else f"BENIGN::{nome}"
-            arestas[ilha].extend([(nome, tipo) + tuple(l) for l in linhas])
+    con.execute("SET memory_limit='1GB'; SET threads=2")
+    con.execute(f"ATTACH '{BANCO}' AS b (READ_ONLY)")
+    return con
+
+
+def escolher_dataset(con):
+    return DATASET or con.execute("SELECT min(dataset) FROM b.fluxos").fetchone()[0]
+
+
+def ilha_de(arq, tipo):
+    return tipo if tipo != "BENIGN" else f"BENIGN::{os.path.splitext(arq)[0]}"
+
+
+def ler_banco():
+    con = conectar()
+    ds = escolher_dataset(con)
+    filtro, par = "dataset = ? AND dia = ?", [ds, DIA]
+    n = con.execute(f"SELECT count(*) FROM b.fluxos WHERE {filtro}", par).fetchone()[0]
+    if not n:
+        sys.exit(f"Nenhum fluxo no banco para dataset={ds}, dia={DIA}")
+    print(f"lendo do banco: {ds}, dia {DIA} ({n} fluxos)", flush=True)
+    nulos = con.execute(f"SELECT count(*) FROM b.fluxos WHERE {filtro} AND (sip IS NULL OR dip IS NULL "
+                        "OR sport IS NULL OR dport IS NULL)", par).fetchone()[0]
+    if nulos:
+        print(f"   {nulos} fluxos sem IP ou porta foram desconsiderados")
+    minutos, minutos_ilha = defaultdict(set), defaultdict(set)
+    arestas, totais = defaultdict(list), Counter()
+    for arq, tipo, mi in con.execute(f"""SELECT arquivo, tipo, CAST(epoch(date_trunc('minute', ts)) / 60 AS BIGINT)
+                                         FROM b.fluxos WHERE {filtro} AND ts IS NOT NULL GROUP BY 1, 2, 3""", par).fetchall():
+        minutos[tipo].add(int(mi))
+        minutos_ilha[ilha_de(arq, tipo)].add(int(mi))
+    pares = con.execute(f"SELECT arquivo, tipo, count(*) FROM b.fluxos WHERE {filtro} GROUP BY 1, 2 ORDER BY 1, 2", par).fetchall()
+    for arq, tipo, c in pares:
+        totais[ilha_de(arq, tipo)] += int(c)
+        print(f"   amostrando {tipo} de {arq} ...", flush=True)
+        # amostra reproduzivel: os N fluxos com menor hash do conteudo (mesma amostra a cada execucao)
+        for ts, sip, sport, dip, dport in con.execute(f"""
+                SELECT CAST(ts AS VARCHAR), sip, sport, dip, dport FROM b.fluxos
+                WHERE {filtro} AND arquivo = ? AND tipo = ?
+                  AND sip IS NOT NULL AND dip IS NOT NULL AND sport IS NOT NULL AND dport IS NOT NULL
+                ORDER BY hash(CAST(ts AS VARCHAR), sip, sport, dip, dport, {SEMENTE_AMOSTRA}),
+                         CAST(ts AS VARCHAR), sip, sport, dip, dport
+                LIMIT {N_FLUXOS}""", par + [arq, tipo]).fetchall():
+            arestas[ilha_de(arq, tipo)].append((os.path.splitext(arq)[0], tipo, None, ts, sip, sport, dip, dport))
     return minutos, arestas, totais, minutos_ilha
 
 
@@ -286,7 +280,7 @@ def construir_ilhas(np, arestas, totais):
 
 def diagnostico(ilhas):
     print()
-    print(f"{'estrutura':<20}{'no CSV':>10}{'usados':>8}{'nós':>6}{'ligações':>10}{'grupos':>8}{'maior':>7}  nó mais ligado")
+    print(f"{'estrutura':<20}{'no banco':>10}{'usados':>8}{'nós':>6}{'ligações':>10}{'grupos':>8}{'maior':>7}  nó mais ligado")
     for i in ilhas:
         k = max(range(i["n"]), key=lambda x: i["deg"][x])
         print(f"{i['arquivo']:<20}{i['total']:>10}{len(i['linhas']):>8}{i['n']:>6}{len(i['edges']):>10}"
@@ -368,7 +362,7 @@ def tempo(minutos):
 def passo_medir():
     import numpy as np
 
-    minutos, arestas, totais, minutos_ilha = ler_csvs()
+    minutos, arestas, totais, minutos_ilha = ler_banco()
     ilhas = construir_ilhas(np, arestas, totais)
     if not ilhas:
         sys.exit("Nenhum grafo construido. Confira os CSVs.")
@@ -416,32 +410,28 @@ def passo_verificar():
         por_chave[r["chave"]].append(r)
         por_arq[r["arquivo"]].append(r)
 
-    print("A) cada fluxo auditado existe no CSV original, com o mesmo rotulo e os mesmos IPs e portas")
-    con = duckdb.connect()
-    con.sql("SET memory_limit='1GB'; SET threads=2;")
-    achados = Counter()
-    for nome, rs in por_arq.items():
-        print(f"   conferindo {nome}.csv ...", flush=True)
-        if not criar_f(con, os.path.join(PASTA, nome + ".csv")):
-            continue
-        con.sql("CREATE OR REPLACE TEMP TABLE a (aid BIGINT, chave VARCHAR, label VARCHAR, fid VARCHAR, "
+    print("A) cada fluxo auditado existe no banco, com o mesmo rotulo, horario, IPs e portas")
+    con = conectar()
+    ds = escolher_dataset(con)
+    con.execute("CREATE TEMP TABLE a (aid BIGINT, chave VARCHAR, arquivo VARCHAR, label VARCHAR, "
                 "ts VARCHAR, sip VARCHAR, sport BIGINT, dip VARCHAR, dport BIGINT)")
-        con.executemany("INSERT INTO a VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [(k, r["chave"], r["label"], r["flow_id"] or None, r["timestamp"] or None,
-                          r["sip"], int(r["sport"]), r["dip"], int(r["dport"])) for k, r in enumerate(rs)])
-        for chave, c in con.sql("""
-            SELECT a.chave, COUNT(DISTINCT a.aid)
-            FROM a JOIN (SELECT fid, CAST(ts AS VARCHAR) AS ts, sip, sport, dip, dport, tipo FROM f) o
-              ON a.fid IS NOT DISTINCT FROM o.fid AND a.ts IS NOT DISTINCT FROM o.ts
-             AND a.sip = o.sip AND a.sport = o.sport AND a.dip = o.dip AND a.dport = o.dport
-             AND a.label = o.tipo
-            GROUP BY 1
-        """).fetchall():
-            achados[chave] += int(c)
+    con.executemany("INSERT INTO a VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(k, r["chave"], r["arquivo"], r["label"], r["timestamp"] or None,
+                      r["sip"], int(r["sport"]), r["dip"], int(r["dport"])) for k, r in enumerate(linhas)])
+    achados = Counter()
+    for chave, c in con.execute("""
+        SELECT a.chave, COUNT(DISTINCT a.aid)
+        FROM a JOIN b.fluxos o
+          ON o.dataset = ? AND o.dia = ? AND o.arquivo = a.arquivo || '.csv' AND o.tipo = a.label
+         AND CAST(o.ts AS VARCHAR) IS NOT DISTINCT FROM a.ts
+         AND o.sip = a.sip AND o.sport = a.sport AND o.dip = a.dip AND o.dport = a.dport
+        GROUP BY 1
+    """, [ds, DIA]).fetchall():
+        achados[chave] += int(c)
 
     print()
     print("B) o grafo desenhado corresponde a lista de fluxos auditada (reconstrucao independente)")
-    print(f"{'estrutura':<20}{'fluxos':>8}{'achados no CSV':>16}{'nós':>6}{'ligações':>10}{'graus':>8}{'grupos':>8}")
+    print(f"{'estrutura':<20}{'fluxos':>8}{'no banco':>16}{'nós':>6}{'ligações':>10}{'graus':>8}{'grupos':>8}")
     tudo_ok = True
     for chave in sorted(por_chave, key=lambda x: (x.startswith("BENIGN"), x)):
         rs = por_chave[chave]
@@ -530,7 +520,7 @@ HTML = r"""<!DOCTYPE html>
 <body>
 <div id="app">
   <div id="esq">
-    <div class="box"><svg id="map" role="img" aria-label="Grafos de cada tipo de tráfego do dia de teste"></svg></div>
+    <div class="box"><svg id="map" role="img" aria-label="Grafos de cada tipo de tráfego"></svg></div>
     <div class="box" id="tl"></div>
   </div>
   <aside class="box" id="lado"></aside>
